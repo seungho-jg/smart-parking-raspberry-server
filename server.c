@@ -33,6 +33,8 @@ extern int read_parking_records(MYSQL *mysql, char *buf, int space_id);  // 특�
 extern int read_parking_space(MYSQL *mysql, char *buf, int space_id); // 주차공간 상태 조회
 extern int init_parking_spaces(MYSQL *mysql); // 주차공간 초기화
 extern int get_occupied_count(MYSQL *mysql); // 현재 주차중인 차량 수 조회
+extern int update_parking_entry_time(MYSQL *mysql, int space_id); // 차량 진입시 entry_time 업데이트
+extern int calculate_parking_fee(MYSQL *mysql, int space_id); // 요금 계산
 extern int closeDB(MYSQL *mysql);
 
 
@@ -85,7 +87,7 @@ int main() {
         fprintf(stderr, "Failed to create read thread\n");
         return 1;
     }
-   
+
     // 스레드가 종료될 때까지 메인 스레드는 대기
     pthread_join(tcp_tid, NULL);
     pthread_join(arduino_tid, NULL);
@@ -106,16 +108,16 @@ void error_handling(char *message)
 void *arduino_read_thread(void *arg) {
     char buffer[256];
     int buffer_pos = 0;
-    
+
     while(1) {
         if (serialDataAvail(serial_fd)) {
             char newChar = serialGetchar(serial_fd);
-            
+
             if (newChar == '\n' || newChar == '\r') {
                 if (buffer_pos > 0) {
                     buffer[buffer_pos] = '\0';
                     printf("아두이노에서 받음: %s\n", buffer);
-                    
+
                     // "1:true" 또는 "1:false" 형식 파싱
                     int space_id;
                     char sensor_value[10];
@@ -129,11 +131,11 @@ void *arduino_read_thread(void *arg) {
                             } else {
                                 continue; // 잘못된 값
                             }
-                            
+
                             update_parking_status(space_id - 1, new_status); // 배열은 0부터 시작
                         }
                     }
-                    
+
                     buffer_pos = 0;
                 }
             } else {
@@ -151,7 +153,7 @@ void *arduino_read_thread(void *arg) {
 void update_parking_status(int space_id, char new_status) {
     char old_status = parking_status[space_id];
     char upload_status[255] = "";
-    
+
     // 상태 변화가 있을 때만 처리
     if (old_status != new_status) {
         parking_status[space_id] = new_status;
@@ -167,9 +169,28 @@ void update_parking_status(int space_id, char new_status) {
         } else {
             strcpy(upload_status, "UNKNOWN");
         }
-        
-         printf("DB 업데이트: space_id=%d, status=%s\n", space_id + 1, upload_status);
-        
+
+        printf("DB 업데이트: space_id=%d, status=%s\n", space_id + 1, upload_status);
+
+        // 상태별 주차기록 처리
+        if (old_status == '1' && new_status == '2') {
+            // 예약됨 → 점유됨: 차량 진입 감지
+            printf("차량 진입 감지: 주차기록 entry_time 업데이트\n");
+            update_parking_entry_time(&mysql, space_id + 1);
+        } else if (old_status == '2' && new_status == '0') {
+            // 점유됨 → 사용가능: 차량 이탈 감지
+            printf("차량 이탈 감지: 주차기록 exit_time 업데이트\n");
+            int parking_fee = calculate_parking_fee(&mysql, space_id + 1);
+            update_parking_exit(&mysql, space_id + 1, parking_fee);
+        } else if (old_status == '1' && new_status == '0') {
+            // 예약됨 → 사용가능: 예약 취소 (Java에서 처리됨)
+            printf("예약 취소 또는 예약 시간 초과\n");
+        } else if (old_status == '0' && new_status == '2') {
+            insert_guest_parking_record(&mysql, space_id + 1);
+            printf("비회원 주차기록 업데이트 완료\n");
+        }
+            
+
         // 아두이노 LED 제어
         send_to_arduino(space_id + 1, new_status);
         update_parking_space_status(&mysql, space_id + 1, upload_status);
@@ -186,7 +207,7 @@ void send_to_arduino(int space_id, char status) {
     } else if (status == '2') {
         sprintf(command, "%d:OCCUPIED", space_id);
     }
-    
+
     serialPuts(serial_fd, command);
     printf("아두이노에 전송: %s\n", command);
 }
@@ -213,7 +234,7 @@ void *tcp_server_thread(void *arg) {
 
     if(bind(server_fd, (struct sockaddr *) &server_adr, sizeof(server_adr))==-1)
         error_handling("bind() error");
-    
+
     if(listen(server_fd, 5)==-1)
         error_handling("listen() error");
 
@@ -238,7 +259,7 @@ void *tcp_server_thread(void *arg) {
         java_fd = -1;
         printf("Java WAS 연결 끊어짐\n");
     }
-    
+
 }
 
 // Java에서 오는 메시지 계속 읽기
@@ -246,15 +267,15 @@ void *java_tcp_thread(void *arg) {
     int client_fd = *(int*)arg;
     char buffer[256];
     int bytes;
-    
+
     while(1) {
         // Java에서 명령 받기
         bytes = recv(client_fd, buffer, sizeof(buffer)-1, 0);
         if(bytes <= 0) break; // 연결 끊어짐
-        
+
         buffer[bytes] = '\0';
         printf("Java에서 받음: %s\n", buffer);
-        
+
         // 명령 처리
         if (strncmp(buffer, "GET_ALL", 7) == 0) {
             // 전체 상태 전송: "24:000111222000111222000111"
@@ -262,7 +283,7 @@ void *java_tcp_thread(void *arg) {
             sprintf(response, "24:%s\n", parking_status);
             send(client_fd, response, strlen(response), 0);
             printf("Java에게 전송: %s", response);
-            
+
         } else if (strncmp(buffer, "RESERVE:", 8) == 0) {
             // 예약 명령: "RESERVE:3"
             int space_id;
@@ -279,7 +300,7 @@ void *java_tcp_thread(void *arg) {
                     }
                 }
             }
-            
+
         } else if (strncmp(buffer, "CANCEL:", 7) == 0) {
             // 예약 취소 명령: "CANCEL:3"
             int space_id;
@@ -298,6 +319,6 @@ void *java_tcp_thread(void *arg) {
             }
         }
     }
-    
+
     return NULL;
 }

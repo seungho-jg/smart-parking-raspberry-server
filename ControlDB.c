@@ -261,6 +261,55 @@ int get_occupied_count(MYSQL *mysql)
     return count;
 }
 
+// 차량 진입시 entry_time 업데이트 (Java 예약 → 센서 감지)
+int update_parking_entry_time(MYSQL *mysql, int space_id)
+{
+    char strQuery[512] = "";
+    // entry_time이 NULL인 예약 기록을 찾아서 현재 시간으로 업데이트
+    sprintf(strQuery, "UPDATE parking_records SET entry_time=NOW() WHERE space_id=%d AND entry_time IS NULL AND exit_time IS NULL ORDER BY id DESC LIMIT 1", space_id);
+    int res = mysql_query(mysql, strQuery);
+
+    if(!res) {
+        if(mysql_affected_rows(mysql) > 0) {
+            printf("(i) entry time updated: space_id=%d\n", space_id);
+            return 0;
+        } else {
+            printf("(!) no reservation found for space_id=%d\n", space_id);
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "(!) update entry time error %d : %s\n", mysql_errno(mysql), mysql_error(mysql));
+        return -1;
+    }
+}
+
+// 요금 계산 함수 (시간당 1000원, 최소 1시간)
+int calculate_parking_fee(MYSQL *mysql, int space_id)
+{
+    char strQuery[512] = "";
+    sprintf(strQuery, "SELECT TIMESTAMPDIFF(HOUR, entry_time, NOW()) as hours FROM parking_records WHERE space_id=%d AND entry_time IS NOT NULL AND exit_time IS NULL ORDER BY entry_time DESC LIMIT 1", space_id);
+    
+    int res = mysql_query(mysql, strQuery);
+    if(res != 0) {
+        fprintf(stderr, "(!) query error %d : %s\n", mysql_errno(mysql), mysql_error(mysql));
+        return 1000; // 기본 1시간 요금
+    }
+
+    MYSQL_RES *res_ptr = mysql_use_result(mysql);
+    MYSQL_ROW sqlrow = mysql_fetch_row(res_ptr);
+
+    int hours = 1; // 기본 1시간
+    if(sqlrow && sqlrow[0]) {
+        hours = atoi(sqlrow[0]);
+        if(hours == 0) hours = 1; // 최소 1시간
+    }
+
+    mysql_free_result(res_ptr);
+    int fee = hours * 1000; // 시간당 1000원
+    printf("(i) calculated parking fee: %d hours = %d won\n", hours, fee);
+    return fee;
+}
+
 // DB 접속 종료하기
 int closeDB(MYSQL *mysql)
 {
